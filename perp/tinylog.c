@@ -50,7 +50,7 @@ extern char **environ;
 
 /* logging variables in scope: */
 static const char *progname = NULL;
-static const char prog_usage[] = "[-hV] [-k numkeep] [-r] [-s logsize] [-t] [-z] dir";
+static const char prog_usage[] = "[-hV] [-k numkeep] [-m maxagesecs] [-r] [-s logsize] [-t] [-z] dir";
 static const char *my_pidstr = NULL;
 
 /*
@@ -62,9 +62,11 @@ struct tinylog {
     int          fd_logdir;
     int          fd_pidlock;
     int          fd_current;
+    time_t       fd_current_starttime;
     size_t       current_size;
     size_t       current_max;
     size_t       keep_max;
+    size_t       max_age_secs;
     int          wantstamp; 
     int          wantzip; 
 };
@@ -96,7 +98,7 @@ const char *gzip_path = NULL;
 /* default maximum size for log file (bytes): */
 #define CURRENT_MAX  100000
 /* maximum size for line in log file (bytes): */
-#define LOGLINE_MAX    1000
+#define LOGLINE_MAX    4096
 /* pause on exceptional error (billionths of second): */
 #define EPAUSE  555444321UL
 
@@ -321,6 +323,9 @@ init_current(struct tinylog *tinylog, int resume)
     }
     fd_cloexec(fd);
 
+    /* Set UNIX time for when fd_current gets update */
+    tinylog->fd_current_starttime = time(NULL);
+
     /* all set: */
     tinylog->fd_current = fd;
     tinylog->current_size = new ? 0 : sb.st_size;
@@ -360,6 +365,9 @@ tinylog_rotate(struct tinylog *tinylog)
     RETRY((fchmod(fd, 0644) == -1),
         "failure fchmod() for new current");
     fd_cloexec(fd);
+
+    /* Set UNIX time for when fd_current gets update */
+    tinylog->fd_current_starttime = time(NULL);
 
     /* all set: */
     tinylog->fd_current = fd;
@@ -611,6 +619,12 @@ tinylog_post(struct tinylog *tinylog, char *logline, size_t len)
     /* rotate? */
     if(flagrotate || (tinylog->current_size >= (tinylog->current_max - len))){
         tinylog_rotate(tinylog);
+    } else {
+        // check for time elapsed
+        time_t current_time = time(NULL);
+        if (difftime(current_time, tinylog->fd_current_starttime) >= tinylog->max_age_secs) {
+            tinylog_rotate(tinylog);
+        }
     }
 
     /* post logline: */
@@ -686,7 +700,7 @@ do_log(struct tinylog *tinylog)
 int
 main(int argc, char *argv[])
 {
-    nextopt_t         nopt = nextopt_INIT(argc, argv, ":hVk:rs:tz");
+    nextopt_t         nopt = nextopt_INIT(argc, argv, ":hVk:m:rs:tz");
     char              opt;
     static char       pidbuf[NFMT_SIZE];
     struct tinylog    tinylog;
@@ -700,6 +714,7 @@ main(int argc, char *argv[])
     tinylog.wantzip = 0;
     tinylog.current_max = CURRENT_MAX;
     tinylog.keep_max = 5;
+    tinylog.max_age_secs = 3600; //1 hour
 
     mypid = getpid();
     my_pidstr = nfmt_uint32(pidbuf, (uint32_t)mypid);
@@ -707,6 +722,13 @@ main(int argc, char *argv[])
     while((opt = nextopt(&nopt))){
         char optc[2] = {nopt.opt_got, '\0'};
         switch(opt){
+        case 'm':
+            z = nuscan_uint32(&n, nopt.opt_arg);
+            if(*z != '\0'){
+                fatal_usage("numeric argument required for option -", optc);
+            }
+            tinylog.max_age_secs = (size_t) n;
+            break;
         case 'h': usage(); die(0); break;
         case 'V': version(); die(0); break;
         case 'k':
